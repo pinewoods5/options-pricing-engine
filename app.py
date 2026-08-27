@@ -13,7 +13,7 @@ from pricers import binomial
 from pricers import black_scholes as bs
 from pricers import monte_carlo as mc
 from pricers.common import OptionParams
-from ui import charts
+from ui import charts, copy
 
 # Lighter than compare.py's CLI defaults (500 steps / 500k paths) so the
 # interactive sliders stay snappy; still visually convergent.
@@ -23,16 +23,55 @@ MC_SEED = 42
 
 st.set_page_config(page_title="Options Pricing", layout="centered")
 
-st.title("Options Pricing")
+st.markdown(
+    """
+    <style>
+    #MainMenu, footer, header {visibility: hidden;}
+    .block-container {padding-top: 3rem; padding-bottom: 4rem; max-width: 680px;}
+    h1 {font-weight: 600; letter-spacing: -0.02em; margin-bottom: 0.2rem;}
+    div[data-testid="stMetricValue"] {font-size: 2.6rem; font-weight: 600;}
+    div[data-testid="stMetric"] {text-align: center;}
+    hr {margin: 2.2rem 0;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("What's this option worth?")
+st.caption(
+    "Adjust the numbers on the left and watch the price update. "
+    "Hover the (?) next to any label for a plain-English explanation."
+)
 
 with st.sidebar:
     st.header("Option details")
-    spot = st.slider("Spot price", min_value=1.0, max_value=500.0, value=100.0, step=1.0)
-    strike = st.slider("Strike price", min_value=1.0, max_value=500.0, value=100.0, step=1.0)
-    rate = st.slider("Interest rate", min_value=0.0, max_value=0.15, value=0.05, step=0.005)
-    vol = st.slider("Volatility", min_value=0.01, max_value=1.0, value=0.2, step=0.01)
-    time = st.slider("Time to expiry (years)", min_value=0.05, max_value=3.0, value=1.0, step=0.05)
-    option_type = st.radio("Option type", options=["call", "put"], horizontal=True)
+    spot = st.slider(
+        "Stock price", min_value=1.0, max_value=500.0, value=100.0, step=1.0,
+        help=copy.INPUTS["spot"],
+    )
+    strike = st.slider(
+        "Strike price", min_value=1.0, max_value=500.0, value=100.0, step=1.0,
+        help=copy.INPUTS["strike"],
+    )
+    rate = st.slider(
+        "Interest rate", min_value=0.0, max_value=0.15, value=0.05, step=0.005,
+        format="%.1f%%", help=copy.INPUTS["rate"],
+    )
+    vol = st.slider(
+        "Volatility", min_value=0.01, max_value=1.0, value=0.2, step=0.01,
+        format="%.0f%%", help=copy.INPUTS["vol"],
+    )
+    time = st.slider(
+        "Time to expiry (years)", min_value=0.05, max_value=3.0, value=1.0, step=0.05,
+        help=copy.INPUTS["time"],
+    )
+    option_type = st.radio(
+        "Option type",
+        options=["call", "put"],
+        format_func=lambda t: "Call (right to buy)" if t == "call" else "Put (right to sell)",
+        horizontal=True,
+        help=copy.INPUTS["option_type"],
+    )
 
 params = OptionParams(spot=spot, strike=strike, rate=rate, vol=vol, time=time, option_type=option_type)
 
@@ -43,26 +82,51 @@ american_tree_price = binomial.price_american(params, steps=BINOMIAL_STEPS)
 mc_result = mc.price(params, n_paths=MC_PATHS, seed=MC_SEED)
 
 st.metric("Price", f"${bs_price:,.2f}")
-st.caption(f"This option would cost about ${bs_price:,.2f} today.")
+st.caption(
+    f"<div style='text-align:center'>This option would cost about "
+    f"<b>${bs_price:,.2f}</b> today.</div>",
+    unsafe_allow_html=True,
+)
+
+st.divider()
 
 st.subheader("Three ways of calculating this")
+st.caption(
+    "Three completely different methods, cross-checked against each other. "
+    "They agree, which is a good sign the price is right."
+)
 col1, col2, col3 = st.columns(3)
 col1.metric("Black-Scholes", f"${bs_price:,.2f}")
 col2.metric("Binomial tree", f"${euro_tree_price:,.2f}")
 col3.metric("Monte Carlo", f"${mc_result.price:,.2f}")
-st.caption(f"Monte Carlo 95% confidence interval: ${mc_result.ci_low:,.2f} - ${mc_result.ci_high:,.2f}")
+st.caption(
+    f"Monte Carlo's own estimate of its uncertainty (95% confidence "
+    f"interval): ${mc_result.ci_low:,.2f} - ${mc_result.ci_high:,.2f}"
+)
+st.caption(
+    f"If early exercise were allowed (an \"American\" option), this would "
+    f"be worth ${american_tree_price:,.2f} instead."
+)
 
-st.caption(f"American-style version (early exercise allowed): ${american_tree_price:,.2f}")
+st.divider()
 
 with st.expander("What affects this price?"):
-    st.write(f"Delta: {bs_greeks.delta:.4f}")
-    st.write(f"Gamma: {bs_greeks.gamma:.4f}")
-    st.write(f"Vega: {bs_greeks.vega:.4f}")
-    st.write(f"Theta: {bs_greeks.theta:.4f}")
-    st.write(f"Rho: {bs_greeks.rho:.4f}")
+    st.markdown(f"**Delta: {bs_greeks.delta:.2f}** — {copy.GREEKS['delta']}")
+    st.markdown(f"**Gamma: {bs_greeks.gamma:.4f}** — {copy.GREEKS['gamma']}")
+    st.markdown(f"**Vega: {bs_greeks.vega:.2f}** — {copy.GREEKS['vega']}")
+    st.markdown(f"**Theta: {bs_greeks.theta:.2f}** — {copy.GREEKS['theta']}")
+    st.markdown(f"**Rho: {bs_greeks.rho:.2f}** — {copy.GREEKS['rho']}")
 
 with st.expander("How was this calculated?"):
-    st.write("Binomial tree convergence")
+    st.write(
+        "The binomial tree breaks time into small steps and works out the "
+        "price by looking ahead; the more steps, the closer it gets to the "
+        "Black-Scholes answer (the dashed line)."
+    )
     st.pyplot(charts.binomial_convergence_figure(params, bs_price, BINOMIAL_STEPS))
-    st.write("Monte Carlo convergence")
+    st.write(
+        "Monte Carlo simulates thousands of random possible futures for "
+        "the stock and averages the results; the more simulations, the "
+        "tighter its confidence band gets around the true price."
+    )
     st.pyplot(charts.monte_carlo_convergence_figure(params, bs_price, MC_PATHS, MC_SEED))
