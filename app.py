@@ -13,7 +13,7 @@ from pricers import binomial
 from pricers import black_scholes as bs
 from pricers import monte_carlo as mc
 from pricers.common import OptionParams
-from ui import charts, copy, videos
+from ui import background, charts, copy, videos
 
 # Lighter than compare.py's CLI defaults (500 steps / 500k paths) so the
 # interactive sliders stay snappy; still visually convergent.
@@ -32,10 +32,25 @@ st.markdown(
     div[data-testid="stMetricValue"] {font-size: 2.6rem; font-weight: 600;}
     div[data-testid="stMetric"] {text-align: center;}
     hr {margin: 2.2rem 0;}
+
+    /* Ambient background component: stretch it to a fixed full-viewport
+       layer behind everything else (see ui/background.py). It's the only
+       st.iframe in this app, so this selector is unambiguous. */
+    [data-testid="stIFrame"] {
+        position: fixed !important;
+        inset: 0 !important;
+        width: 100vw !important;
+        height: 100vh !important;
+        z-index: -1 !important;
+        border: none !important;
+        pointer-events: auto;
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+background.render_background()
 
 st.title("What's this option worth?")
 st.caption(
