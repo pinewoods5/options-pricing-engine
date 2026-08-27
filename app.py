@@ -33,15 +33,53 @@ st.markdown(
     div[data-testid="stMetric"] {text-align: center;}
     hr {margin: 2.2rem 0;}
 
+    /* Streamlit paints an opaque white background on both <body> and its
+       own [data-testid="stApp"] wrapper. Both sit *above* our z-index:-1
+       background iframe in the stacking order, so left as-is they fully
+       hide it -- the canvas draws correctly underneath, it's just covered.
+       Making these two transparent is what actually lets it show through. */
+    body, [data-testid="stApp"], [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+        background: transparent !important;
+    }
+
+    /* The content column then gets its own frosted panel so text stays
+       calm and high-contrast, with the ambient motion visible around and
+       through its translucent edges rather than directly behind the text. */
+    /* No backdrop-filter here on purpose: filter/backdrop-filter on an
+       ancestor establishes a new CSS containing block for position:fixed
+       descendants, which would hijack the background iframe below into
+       anchoring to this panel instead of the viewport. A solid
+       (non-blurred) translucent background keeps text crisp without that
+       side effect. */
+    [data-testid="stMainBlockContainer"] {
+        background: rgba(255, 255, 255, 0.94);
+        border-radius: 28px;
+        padding-left: 3rem;
+        padding-right: 3rem;
+        margin-top: 1.5rem;
+        margin-bottom: 1.5rem;
+    }
+
     /* Ambient background component: stretch it to a fixed full-viewport
        layer behind everything else (see ui/background.py). It's the only
-       st.iframe in this app, so this selector is unambiguous. */
+       st.iframe in this app, so this selector is unambiguous.
+
+       z-index here was chosen empirically via headless-browser inspection,
+       not by theory: z-index -1 and 0 both drew the canvas correctly (
+       confirmed via its own pixel data) but the iframe never actually
+       composited as visible on screen -- some low/negative z-index
+       iframes don't reliably layer correctly in this Chromium/Streamlit
+       combination. A clearly positive value composites correctly and
+       still stays below every other app element, all of which sit at
+       z-index >= 999990 (Streamlit's own header/sidebar) or paint after
+       this component in DOM order (everything else in the main content
+       column, since render_background() runs first in app.py). */
     [data-testid="stIFrame"] {
         position: fixed !important;
         inset: 0 !important;
         width: 100vw !important;
         height: 100vh !important;
-        z-index: -1 !important;
+        z-index: 1 !important;
         border: none !important;
         pointer-events: auto;
     }
