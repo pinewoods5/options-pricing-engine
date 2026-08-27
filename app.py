@@ -13,7 +13,7 @@ from pricers import binomial
 from pricers import black_scholes as bs
 from pricers import monte_carlo as mc
 from pricers.common import OptionParams
-from ui import charts, copy
+from ui import charts, copy, videos
 
 # Lighter than compare.py's CLI defaults (500 steps / 500k paths) so the
 # interactive sliders stay snappy; still visually convergent.
@@ -99,6 +99,13 @@ col1, col2, col3 = st.columns(3)
 col1.metric("Black-Scholes", f"${bs_price:,.2f}")
 col2.metric("Binomial tree", f"${euro_tree_price:,.2f}")
 col3.metric("Monte Carlo", f"${mc_result.price:,.2f}")
+
+for col, key in zip((col1, col2, col3), ("black_scholes", "binomial", "monte_carlo")):
+    video = videos.VIDEOS[key]
+    with col.expander("▶ Watch a 5-min explanation"):
+        st.caption(f"{video['title']} — {video['channel']}")
+        st.markdown(videos.embed_html(video["youtube_id"]), unsafe_allow_html=True)
+
 st.caption(
     f"Monte Carlo's own estimate of its uncertainty (95% confidence "
     f"interval): ${mc_result.ci_low:,.2f} - ${mc_result.ci_high:,.2f}"
