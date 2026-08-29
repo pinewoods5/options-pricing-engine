@@ -165,7 +165,7 @@ def american_premium(structure: Structure, steps: int = G.DEFAULT_BINOMIAL_STEPS
     return american.values["price"] - european.values["price"]
 
 
-def fingerprint(structure: Structure) -> str:
+def fingerprint(structure: Structure, context: dict | None = None) -> str:
     """A stable id for "the same position, near enough".
 
     The AI read is the one expensive part of an analysis, so it is cached
@@ -178,6 +178,14 @@ def fingerprint(structure: Structure) -> str:
 
     Legs are sorted so that the same position entered in a different order is
     recognised as the same position.
+
+    `context` is anything else the read was written from -- market state, and
+    the version of the prompt that produced it. It has to be part of the key:
+    two identical structures looked at in different market conditions would
+    otherwise collide and serve a read describing the wrong one, and a changed
+    prompt would keep serving answers written by the old one. Callers round
+    their own values before passing them, and should round hard -- market data
+    moves constantly, and a key that tracked every tick would never hit.
     """
     import hashlib
 
@@ -195,6 +203,7 @@ def fingerprint(structure: Structure) -> str:
             f"{round(structure.dividend / 0.0005) * 0.0005:.4f}",
             f"{round(structure.time * 365):d}",
             *(f"{t}:{k}:{q}" for t, k, q in legs),
+            *(f"{k}={context[k]}" for k in sorted(context or {})),
         ]
     )
     return hashlib.sha256(payload.encode()).hexdigest()[:32]

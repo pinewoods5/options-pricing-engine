@@ -89,7 +89,68 @@ const state = {
   history: [],
   hover: null,
   readFor: null, // fingerprint the current read belongs to
+
+  // Market data. `provenance` records where each prefilled field came from and
+  // is cleared per field the moment the reader edits it -- prefill must never
+  // become hijack, because "what if vol were 40%" is the whole point of having
+  // an editable ticket.
+  market: { enabled: false, label: "", delay_description: "" },
+  provenance: {},
+  chainOpen: false,
+  chain: {
+    query: "",
+    matches: [],
+    symbol: null,
+    expirations: [],
+    expiration: null,
+    data: null,
+    loading: false,
+    error: null,
+    window: 12,
+    legIndex: 0,
+  },
 };
+
+/* The request body. Built explicitly rather than by serializing state, so that
+   the browser's own bookkeeping stays out of it and the market context is sent
+   in the shape the API declares.
+
+   The market half is what the AI read reasons about, and it travels with the
+   request rather than being re-fetched server-side: the chain is already
+   cached, and a second lookup could return a different snapshot than the one
+   the reader is actually looking at. */
+function structurePayload() {
+  const s = state.structure;
+  return {
+    name: s.name, underlying: s.underlying, spot: s.spot, rate: s.rate,
+    vol: s.vol, time: s.time, dividend: s.dividend, style: s.style,
+    legs: s.legs.map((leg) => ({
+      option_type: leg.option_type,
+      strike: leg.strike,
+      quantity: leg.quantity,
+      market: leg.market
+        ? {
+            symbol: leg.market.symbol,
+            price: leg.market.price,
+            market_iv: leg.market.marketIv,
+            used_iv: s.vol,
+            iv_source: leg.market.iv.source,
+            iv_note: leg.market.iv.note,
+            price_quality: leg.market.quality.price.status,
+            iv_quality: leg.market.quality.implied_vol.status,
+            spread: leg.market.spread,
+            volume: leg.market.volume,
+            open_interest: leg.market.openInterest,
+          }
+        : null,
+    })),
+  };
+}
+
+/* Editing a field makes it the reader's, not the market's. */
+function overrides(field) {
+  if (state.provenance[field]) delete state.provenance[field];
+}
 
 /* ---------- formatting ----------
    One place, because a figure that appears in the table, the ticket footer and
@@ -154,16 +215,17 @@ async function runAnalyze() {
   try {
     const analysis = await api("/api/analyze", {
       method: "POST",
-      body: JSON.stringify(state.structure),
+      body: JSON.stringify(structurePayload()),
     });
     // A slower earlier request must not overwrite a newer result.
     if (token !== analyzeToken) return;
     state.analysis = analysis;
     state.analyzing = false;
 
-    // The read belongs to a fingerprint. If the position moved far enough to
-    // change it, what is on screen is about a different position -- drop it.
-    if (state.readFor && state.readFor !== analysis.structure.fingerprint) {
+    // The read belongs to a position *in a market*. Its key covers both, plus
+    // the prompt version, so a read stops being valid when any of the three
+    // moves -- not only when the legs change.
+    if (state.readFor && state.readFor !== analysis.read_key) {
       state.read = null;
       state.readFor = null;
       state.readError = null;
@@ -188,7 +250,7 @@ function scheduleRead() {
 
 async function runRead() {
   if (!state.analysis) return;
-  const fingerprint = state.analysis.structure.fingerprint;
+  const fingerprint = state.analysis.read_key;
   if (state.readFor === fingerprint && state.read) return;
 
   state.readError = null;
@@ -201,7 +263,7 @@ async function runRead() {
     response = await fetch("/api/read", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(state.structure),
+      body: JSON.stringify(structurePayload()),
     });
   } catch (error) {
     state.readStatus = null;
@@ -245,6 +307,447 @@ async function runRead() {
   }
   state.readStatus = null;
   render();
+}
+
+/* ---------- market: the chain browser ---------- */
+
+let searchTimer = null;
+
+function searchSymbols(query) {
+  clearTimeout(searchTimer);
+  state.chain.query = query;
+  if (query.trim().length < 1) {
+    state.chain.matches = [];
+    return render();
+  }
+  searchTimer = setTimeout(async () => {
+    try {
+      const found = await api(`/api/market/search?q=${encodeURIComponent(query)}`);
+      state.chain.matches = found.matches;
+    } catch (error) {
+      // A search that fails is an empty search. It must never block the flow,
+      // because typing the symbol by hand still works.
+      state.chain.matches = [];
+    }
+    render();
+  }, 220);
+}
+
+async function pickSymbol(symbol) {
+  const chain = state.chain;
+  chain.symbol = symbol;
+  chain.query = symbol;
+  chain.matches = [];
+  chain.expirations = [];
+  chain.expiration = null;
+  chain.data = null;
+  chain.error = null;
+  chain.loading = true;
+  render();
+  try {
+    const found = await api(`/api/market/${encodeURIComponent(symbol)}/expirations`);
+    chain.expirations = found.expirations;
+    chain.loading = false;
+    render();
+    if (chain.expirations.length) {
+      // Open on a near expiration rather than the front week, which is often
+      // the least representative one on the board.
+      const index = Math.min(2, chain.expirations.length - 1);
+      loadChain(chain.expirations[index].date);
+    }
+  } catch (error) {
+    chain.loading = false;
+    chain.error = error.message;
+    render();
+  }
+}
+
+async function loadChain(expiration) {
+  const chain = state.chain;
+  chain.expiration = expiration;
+  chain.loading = true;
+  chain.error = null;
+  chain.data = null;
+  render();
+  try {
+    chain.data = await api(
+      `/api/market/${encodeURIComponent(chain.symbol)}/chain?expiration=${expiration}`
+    );
+    chain.window = 12;
+  } catch (error) {
+    chain.error = error.message;
+  }
+  chain.loading = false;
+  render();
+}
+
+/* Selecting a contract fills the ticket and records where every value came
+   from. Nothing is locked: each field stays editable and its marker vanishes
+   the moment it is touched. */
+function selectContract(contract) {
+  const data = state.chain.data;
+  const leg = state.structure.legs[state.chain.legIndex];
+  if (!leg) return;
+
+  leg.option_type = contract.type;
+  leg.strike = contract.strike;
+  leg.market = {
+    symbol: contract.symbol,
+    price: contract.mid !== null ? contract.mid : contract.last,
+    marketIv: contract.market_iv,
+    spread:
+      contract.bid !== null && contract.ask !== null ? contract.ask - contract.bid : null,
+    volume: contract.volume,
+    openInterest: contract.open_interest,
+    iv: contract.iv,
+    quality: contract.quality,
+  };
+
+  state.structure.underlying = data.underlying.symbol;
+  state.structure.spot = data.underlying.price;
+  state.structure.time = data.expiration.years_to_expiry;
+  state.structure.dividend = data.underlying.dividend_yield || 0;
+  state.structure.rate = data.rate.rate;
+
+  state.provenance = {
+    underlying: "market", spot: "market", time: "market",
+    dividend: "market", rate: data.rate.is_fallback ? "derived" : "market",
+  };
+  if (contract.iv.value !== null && contract.iv.value !== undefined) {
+    state.structure.vol = contract.iv.value;
+    // "market" means the exchange's own number; "derived" means we solved it
+    // because theirs did not survive the sanity checks.
+    state.provenance.vol = contract.iv.source === "market" ? "market" : "derived";
+  }
+
+  if (state.structure.legs.length === 1) {
+    state.structure.name = `${contract.type === "call" ? "Long call" : "Long put"} ${
+      contract.strike
+    }`;
+  }
+
+  state.chainOpen = false;
+  state.ticketOpen = true;
+  render();
+  runAnalyze();
+}
+
+function flagDot(quality) {
+  if (!quality || !quality.any_flag) return h("span");
+  const missing =
+    quality.price.status === "missing" || quality.implied_vol.status === "missing";
+  return h("span", { class: `flag${missing ? " missing" : ""}` });
+}
+
+function contractReasons(contract) {
+  const out = [];
+  for (const [field, label] of [
+    ["price", "Price"], ["implied_vol", "Implied volatility"], ["liquidity", "Liquidity"],
+  ]) {
+    for (const reason of contract.quality[field].reasons) out.push(`${label}: ${reason}`);
+  }
+  return out;
+}
+
+function chainSide(contract, isCall) {
+  if (!contract) {
+    return [h("td"), h("td"), h("td"), h("td"), h("td", { class: "flag-col" })];
+  }
+  const cells = [
+    h("td", {}, contract.bid === null ? "—" : fmt.money(contract.bid)),
+    h("td", {}, contract.ask === null ? "—" : fmt.money(contract.ask)),
+    h("td", {}, contract.iv.value === null ? "—" : fmt.pct(contract.iv.value)),
+    h("td", { class: "faint" }, contract.open_interest === null ? "—" : String(contract.open_interest)),
+  ];
+  const flag = h(
+    "td",
+    { class: "flag-col", title: contractReasons(contract).join("\n") },
+    flagDot(contract.quality)
+  );
+  const ordered = isCall ? [...cells, flag] : [flag, ...cells];
+  for (const cell of ordered) {
+    cell.classList.add("side-cells");
+    if (contract.in_the_money) cell.classList.add("itm");
+    cell.addEventListener("click", () => selectContract(contract));
+    cell.addEventListener("mouseenter", () => {
+      const reasons = contractReasons(contract);
+      if (reasons.length) {
+        state.pinned = {
+          title: `${contract.symbol}`,
+          body: reasons.join(" · "),
+          unit: null,
+        };
+      }
+    });
+  }
+  return ordered;
+}
+
+function chainTable() {
+  const data = state.chain.data;
+  const byStrike = new Map();
+  for (const c of data.calls) byStrike.set(c.strike, { call: c, put: null });
+  for (const p of data.puts) {
+    const row = byStrike.get(p.strike) || { call: null, put: null };
+    row.put = p;
+    byStrike.set(p.strike, row);
+  }
+  const strikes = [...byStrike.keys()].sort((a, b) => a - b);
+  const atmIndex = strikes.reduce(
+    (best, strike, i) =>
+      Math.abs(strike - data.underlying.price) < Math.abs(strikes[best] - data.underlying.price)
+        ? i
+        : best,
+    0
+  );
+
+  // Windowed around the money. A full chain is hundreds of rows and the reader
+  // is almost always looking near the spot; the rest is one click away.
+  const half = state.chain.window;
+  const low = Math.max(0, atmIndex - half);
+  const high = Math.min(strikes.length, atmIndex + half + 1);
+  const shown = strikes.slice(low, high);
+
+  const header = h(
+    "tr",
+    {},
+    h("th", { class: "side-label", colspan: 5 }, "Calls"),
+    h("th", { class: "strike-col" }, "Strike"),
+    h("th", { class: "side-label", colspan: 5 }, "Puts")
+  );
+  const subhead = h(
+    "tr",
+    {},
+    h("th", {}, "Bid"), h("th", {}, "Ask"), h("th", {}, "IV"), h("th", {}, "OI"),
+    h("th", { class: "flag-col" }),
+    h("th", { class: "strike-col" }),
+    h("th", { class: "flag-col" }),
+    h("th", {}, "Bid"), h("th", {}, "Ask"), h("th", {}, "IV"), h("th", {}, "OI")
+  );
+
+  const rows = shown.map((strike) => {
+    const { call, put } = byStrike.get(strike);
+    return h(
+      "tr",
+      { class: strike === strikes[atmIndex] ? "atm" : "" },
+      ...chainSide(call, true),
+      h("td", { class: "strike-col" }, fmt.money(strike, strike % 1 ? 2 : 0)),
+      ...chainSide(put, false)
+    );
+  });
+
+  const expand = (label, direction) =>
+    h(
+      "tr",
+      { class: "expand-row" },
+      h(
+        "td",
+        { colspan: 11 },
+        h(
+          "button",
+          {
+            onclick: () => {
+              state.chain.window += 15;
+              render();
+            },
+          },
+          label
+        )
+      )
+    );
+
+  const body = [];
+  if (low > 0) body.push(expand(`↑ ${low} more strikes above`));
+  body.push(...rows);
+  if (high < strikes.length) body.push(expand(`↓ ${strikes.length - high} more strikes below`));
+
+  return h("table", { class: "chain" }, h("thead", {}, header, subhead), h("tbody", {}, body));
+}
+
+function chainBrowser() {
+  const chain = state.chain;
+
+  const results = chain.matches.length
+    ? h(
+        "div",
+        { class: "search-results" },
+        chain.matches.map((match) =>
+          h(
+            "button",
+            { class: "search-row", onclick: () => pickSymbol(match.symbol) },
+            h("span", { class: "s-sym" }, match.symbol),
+            h("span", { class: "s-name" }, match.name),
+            h("span", { class: "s-exch" }, match.exchange)
+          )
+        )
+      )
+    : null;
+
+  let body;
+  if (chain.error) {
+    body = h(
+      "div",
+      { class: "chain-empty" },
+      h("h3", {}, "That didn't work"),
+      h("p", {}, chain.error),
+      h("p", { class: "faint" }, "You can still enter everything by hand.")
+    );
+  } else if (chain.loading) {
+    body = h("div", { class: "chain-empty" }, h("p", {}, "Loading…"));
+  } else if (chain.data) {
+    body = chainTable();
+  } else {
+    body = h(
+      "div",
+      { class: "chain-empty" },
+      h("h3", {}, "Find a symbol"),
+      h("p", {}, "Type a ticker or a company name to load its option chain.")
+    );
+  }
+
+  const data = chain.data;
+  return [
+    h(
+      "div",
+      {
+        class: "scrim",
+        onclick: () => {
+          state.chainOpen = false;
+          state.ticketOpen = true;
+          render();
+        },
+      }
+    ),
+    h(
+      "div",
+      { class: "chain-modal", role: "dialog", "aria-label": "Option chain" },
+      h(
+        "div",
+        { class: "chain-head" },
+        h("h2", {}, "Option chain"),
+        h(
+          "div",
+          { class: "search-wrap" },
+          h("input", {
+            type: "text",
+            placeholder: "Symbol or company…",
+            value: chain.query,
+            autofocus: "autofocus",
+            oninput: (event) => searchSymbols(event.target.value),
+          }),
+          results
+        ),
+        data
+          ? h(
+              "div",
+              { class: "chain-spot" },
+              data.underlying.name || data.underlying.symbol,
+              " · ",
+              h("b", {}, fmt.money(data.underlying.price)),
+              " ",
+              data.underlying.currency
+            )
+          : h("div", { class: "chain-spot faint" }, state.market.label),
+        h("div", { style: "flex:1" }),
+        h(
+          "button",
+          {
+            class: "icon-btn",
+            "aria-label": "Close",
+            onclick: () => {
+              state.chainOpen = false;
+              state.ticketOpen = true;
+              render();
+            },
+          },
+          "×"
+        )
+      ),
+      chain.expirations.length
+        ? h(
+            "div",
+            { class: "exp-strip" },
+            chain.expirations.map((expiration) =>
+              h(
+                "button",
+                {
+                  class: `exp${chain.expiration === expiration.date ? " on" : ""}`,
+                  onclick: () => loadChain(expiration.date),
+                },
+                h("div", { class: "e-date" }, expiration.date.slice(5)),
+                h("div", { class: "e-days" }, `${expiration.days_to_expiry}d`)
+              )
+            )
+          )
+        : null,
+      h("div", { class: "chain-body" }, body),
+      h(
+        "div",
+        { class: "chain-foot" },
+        h("span", {}, data ? data.freshness.summary : state.market.delay_description),
+        h("span", {}, "Click any side of a row to use that contract")
+      )
+    ),
+  ];
+}
+
+/* ---------- the market chip ----------
+   Kept visually distinct from the 3/3 badge on purpose. That badge means our
+   three models agree with each other; this means we agree with the market.
+   Those are different claims and the interface must not let one be read as
+   the other. */
+
+function marketCost() {
+  let total = 0;
+  for (const leg of state.structure.legs) {
+    if (!leg.market || leg.market.price === null || leg.market.price === undefined) return null;
+    total += leg.quantity * leg.market.price;
+  }
+  return total;
+}
+
+function marketChip() {
+  const cost = marketCost();
+  if (cost === null || !state.analysis) return null;
+
+  // Only meaningful when the market's own price is trustworthy. A contract
+  // with no bid has no market price worth disagreeing with.
+  const untrusted = state.structure.legs.some(
+    (leg) => leg.market.quality && leg.market.quality.price.status !== "trusted"
+  );
+  if (untrusted) return null;
+
+  const ours = state.analysis.position.price;
+  if (!isFinite(ours) || Math.abs(ours) < 0.01) return null;
+  const difference = (cost - ours) / Math.abs(ours);
+  const tone = Math.abs(difference) < 0.01 ? "inline" : difference > 0 ? "rich" : "cheap";
+  const label =
+    tone === "inline"
+      ? "in line"
+      : `${fmt.pct(Math.abs(difference), 1)} ${difference > 0 ? "richer" : "cheaper"}`;
+
+  return h(
+    "button",
+    {
+      class: `market-chip ${tone}`,
+      title: "How the market's price compares with our model's",
+      onclick: () =>
+        pin(
+          "Market vs our model",
+          tone === "inline"
+            ? "The market is pricing this position essentially where our models do."
+            : `The market is pricing this ${
+                difference > 0 ? "above" : "below"
+              } our model — ${fmt.money(cost)} against ${fmt.money(
+                ours
+              )}. That is a difference of opinion about volatility, not an error in either. ` +
+              "It is a separate question from whether our three models agree with each other.",
+          null
+        ),
+    },
+    h("span", { class: "mc-k" }, "Market"),
+    h("span", { class: "mc-v" }, label)
+  );
 }
 
 /* ---------- context panel ---------- */
@@ -761,7 +1264,7 @@ function analyzeView() {
             } · ${structure.days_to_expiry} days to expiry · ${fmt.pct(structure.vol)} vol`
           )
         ),
-        badge()
+        h("div", { style: "display:flex;align-items:center;gap:9px" }, marketChip(), badge())
       )
     ),
     tabBar(),
@@ -925,11 +1428,29 @@ function contextPanel() {
 
 /* ---------- the structure ticket ---------- */
 
-function numberField(label, value, step, onchange, hint) {
+function numberField(label, value, step, onchange, hint, field) {
+  const source = field ? state.provenance[field] : null;
   return h(
     "div",
     { class: "field" },
-    h("label", {}, label),
+    h(
+      "label",
+      {},
+      label,
+      source
+        ? h(
+            "span",
+            {
+              class: `prov ${source}`,
+              title:
+                source === "market"
+                  ? "Taken from the market data for the contract you picked"
+                  : "Derived by us, because the market's own value did not look reliable",
+            },
+            source === "market" ? "market" : "ours"
+          )
+        : null
+    ),
     h("input", {
       type: "number",
       step,
@@ -938,12 +1459,54 @@ function numberField(label, value, step, onchange, hint) {
         const parsed = parseFloat(event.target.value);
         if (!isNaN(parsed)) {
           onchange(parsed);
+          if (field) overrides(field);
           scheduleAnalyze();
         }
       },
     }),
     hint ? h("div", { class: "faint", style: "font-size:11.5px;margin-top:4px" }, hint) : null
   );
+}
+
+/* Whenever a contract's quoted volatility did not survive the sanity checks,
+   the ticket says so in full, including why. Two cases reach here and both
+   need saying: we solved our own value instead, or there was nothing to solve
+   from either and the number in the box is still the reader's own.
+
+   Substituting quietly would be the single most damaging thing this feature
+   could do -- the whole product rests on numbers being what they claim to be. */
+function ivNote() {
+  const leg = state.structure.legs.find(
+    (l) => l.market && l.market.iv && l.market.iv.note && l.market.iv.source !== "market"
+  );
+  if (!leg) return null;
+  const unusable = leg.market.iv.source === "none";
+  return h(
+    "div",
+    { class: "iv-note" },
+    leg.market.iv.note,
+    unusable
+      ? h(
+          "div",
+          { style: "margin-top:5px" },
+          "The volatility above is still yours — nothing was filled in for it."
+        )
+      : null
+  );
+}
+
+function openChain(legIndex) {
+  state.chain.legIndex = legIndex;
+  state.chainOpen = true;
+  state.ticketOpen = false;
+  if (!state.chain.symbol && state.structure.underlying) {
+    const guess = state.structure.underlying.trim();
+    if (guess && guess !== "—") {
+      searchSymbols(guess);
+      state.chain.query = guess;
+    }
+  }
+  render();
 }
 
 function ticket() {
@@ -1005,6 +1568,20 @@ function ticket() {
           }
         },
       }),
+      state.market.enabled
+        ? h(
+            "button",
+            {
+              class: "leg-del",
+              title: leg.market
+                ? `From ${leg.market.symbol} — click to pick a different contract`
+                : "Pick a real contract from the option chain",
+              style: leg.market ? "color:var(--accent)" : "",
+              onclick: () => openChain(index),
+            },
+            "⌗"
+          )
+        : h("span"),
       structure.legs.length > 1
         ? h(
             "button",
@@ -1069,12 +1646,20 @@ function ticket() {
         h(
           "div",
           { class: "field" },
-          h("label", {}, "Underlying"),
+          h(
+            "label",
+            {},
+            "Underlying",
+            state.provenance.underlying
+              ? h("span", { class: "prov market" }, "market")
+              : null
+          ),
           h("input", {
             type: "text",
             value: structure.underlying,
             oninput: (event) => {
               structure.underlying = event.target.value;
+              overrides("underlying");
               scheduleAnalyze(400);
             },
           })
@@ -1118,21 +1703,28 @@ function ticket() {
       h(
         "div",
         { class: "grid2" },
-        numberField("Underlying price", structure.spot, "0.5", (v) => (structure.spot = v)),
         numberField(
-          "Volatility",
-          structure.vol,
-          "0.01",
-          (v) => (structure.vol = v),
-          "As a decimal: 0.25 is 25%"
+          "Underlying price", structure.spot, "0.5",
+          (v) => (structure.spot = v), null, "spot"
+        ),
+        numberField(
+          "Volatility", structure.vol, "0.01", (v) => (structure.vol = v),
+          "As a decimal: 0.25 is 25%", "vol"
         )
       ),
+      ivNote(),
       h(
         "div",
         { class: "grid3" },
-        numberField("Rate", structure.rate, "0.005", (v) => (structure.rate = v)),
-        numberField("Dividend", structure.dividend, "0.005", (v) => (structure.dividend = v)),
-        numberField("Years to expiry", structure.time, "0.05", (v) => (structure.time = v))
+        numberField("Rate", structure.rate, "0.005", (v) => (structure.rate = v), null, "rate"),
+        numberField(
+          "Dividend", structure.dividend, "0.005",
+          (v) => (structure.dividend = v), null, "dividend"
+        ),
+        numberField(
+          "Years to expiry", structure.time, "0.05",
+          (v) => (structure.time = v), null, "time"
+        )
       )
     ),
     h(
@@ -1259,6 +1851,7 @@ function render() {
     );
   }
   if (state.modalOpen) children.push(...modal());
+  if (state.chainOpen) children.push(...chainBrowser());
   root.replaceChildren(...children.flat(Infinity));
 }
 
@@ -1272,6 +1865,7 @@ async function boot() {
     api("/api/templates"),
   ]);
   state.readAvailable = status.read_available;
+  state.market = status.market || { enabled: false, label: "", delay_description: "" };
   state.glossary = glossary;
   state.templates = templates.templates;
   render();
@@ -1283,7 +1877,10 @@ async function boot() {
 
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
-  if (state.modalOpen) state.modalOpen = false;
+  if (state.chainOpen) {
+    state.chainOpen = false;
+    state.ticketOpen = true;
+  } else if (state.modalOpen) state.modalOpen = false;
   else if (state.ticketOpen) state.ticketOpen = false;
   else return;
   render();

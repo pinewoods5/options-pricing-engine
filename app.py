@@ -42,8 +42,10 @@ from ui import copy
 # must still work perfectly.
 try:
     from regime import client as regime_client
+    from regime import prompts as regime_prompts
 except Exception:  # noqa: BLE001 - any import failure has to be survivable
     regime_client = None
+    regime_prompts = None
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -87,10 +89,33 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Convexity", lifespan=lifespan)
 
 
+class LegMarketIn(BaseModel):
+    """What the browser knows about the contract a leg was built from.
+
+    Optional throughout: a hand-entered position has none of this, and the
+    whole flow has to keep working without it. Accepted rather than re-fetched
+    because the chain is already cached and a second lookup could return a
+    different snapshot than the one the reader is looking at.
+    """
+
+    symbol: str | None = None
+    price: float | None = None
+    market_iv: float | None = None
+    used_iv: float | None = None
+    iv_source: str | None = None
+    iv_note: str | None = None
+    price_quality: str | None = None
+    iv_quality: str | None = None
+    spread: float | None = None
+    volume: int | None = None
+    open_interest: int | None = None
+
+
 class LegIn(BaseModel):
     option_type: Literal["call", "put"]
     strike: float = Field(gt=0)
     quantity: int
+    market: LegMarketIn | None = None
 
 
 class StructureIn(BaseModel):
@@ -127,6 +152,70 @@ class StructureIn(BaseModel):
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _market_context(payload: StructureIn, our_price: float) -> dict | None:
+    """The market half of what the AI read reasons about.
+
+    Returns None unless every leg came from a real contract -- a position that
+    is half real and half invented has no meaningful market price, and quoting
+    one would be worse than quoting none.
+    """
+    legs = [leg for leg in payload.legs if leg.market and leg.market.symbol]
+    if not legs or len(legs) != len(payload.legs):
+        return None
+
+    cost = 0.0
+    priced = True
+    for leg in payload.legs:
+        if leg.market.price is None:
+            priced = False
+            break
+        cost += leg.quantity * leg.market.price
+
+    gap = None
+    if priced and abs(our_price) > 0.01:
+        gap = (cost - our_price) / abs(our_price)
+
+    return {
+        "legs": [
+            {
+                "symbol": leg.market.symbol,
+                "price": leg.market.price,
+                "market_iv": leg.market.market_iv,
+                "used_iv": leg.market.used_iv if leg.market.used_iv is not None else payload.vol,
+                "iv_source": leg.market.iv_source,
+                "iv_note": leg.market.iv_note,
+                "spread": leg.market.spread,
+                "volume": leg.market.volume,
+                "open_interest": leg.market.open_interest,
+            }
+            for leg in payload.legs
+        ],
+        "cost": cost if priced else None,
+        "gap_pct": gap,
+        "freshness": market.capabilities().delay_description,
+    }
+
+
+def _read_key(payload: StructureIn, context: dict | None) -> str:
+    """The cache key for a read: the position, plus the market it was read in.
+
+    Market state has to be in the key or two identical structures looked at in
+    different conditions would collide. It is rounded hard on the way in --
+    volatility to half a point, the market gap to a percent -- because market
+    data moves constantly and a key that tracked every tick would never hit,
+    which would make the cache pointless and the feature expensive.
+    """
+    extra = {"prompt": regime_prompts.PROMPT_VERSION}
+    if context:
+        first = context["legs"][0]
+        if first.get("market_iv") is not None:
+            extra["miv"] = f"{round(first['market_iv'] / 0.005) * 0.005:.3f}"
+        if context.get("gap_pct") is not None:
+            extra["gap"] = f"{round(context['gap_pct'] * 100):d}"
+        extra["src"] = str(first.get("iv_source"))
+    return fingerprint(payload.to_structure(), extra)
 
 
 class ImpliedVolIn(BaseModel):
@@ -234,6 +323,14 @@ def analyze(payload: StructureIn) -> dict:
     started = time.perf_counter()
     result = validate.cross_validate(structure)
     analysis = serialize.analysis_json(structure, result)
+    context = _market_context(payload, analysis["position"]["price"])
+    if context:
+        analysis["market"] = context
+    # The key the AI read is cached under. Reported here so the page can tell
+    # whether the read it is showing still belongs to what it is showing --
+    # which depends on the market state and the prompt version, not only on the
+    # position. `structure.fingerprint` stays the position's own identity.
+    analysis["read_key"] = _read_key(payload, context)
     analysis["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 1)
 
     store.record_history(
@@ -312,7 +409,12 @@ def stream_read(payload: StructureIn) -> StreamingResponse:
     several seconds anyway.
     """
     structure = payload.to_structure()
-    key = fingerprint(structure)
+    reference = validate.cross_validate(structure)
+    analysis = serialize.analysis_json(structure, reference)
+    context = _market_context(payload, analysis["position"]["price"])
+    if context:
+        analysis["market"] = context
+    key = _read_key(payload, context)
 
     def stream():
         cached = store.get_read(key)
@@ -337,7 +439,6 @@ def stream_read(payload: StructureIn) -> StreamingResponse:
             return
 
         _read_times.append(time.time())
-        analysis = serialize.analysis_json(structure, validate.cross_validate(structure))
         try:
             for event, data in regime_client.generate(analysis):
                 if event == "result":

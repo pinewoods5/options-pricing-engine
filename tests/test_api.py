@@ -301,8 +301,179 @@ class TestReadStream:
             application.regime_client, "generate", lambda a: iter([("result", FIXTURE_READ)])
         )
         analysis = client.post("/api/analyze", json=CONDOR).json()
-        fingerprint = analysis["structure"]["fingerprint"]
+        fingerprint = analysis["read_key"]
 
         assert client.get(f"/api/read/{fingerprint}").status_code == 404
         client.post("/api/read", json=CONDOR)
         assert client.get(f"/api/read/{fingerprint}").json()["read"]["headline"]
+
+
+class TestMarketEndpoints:
+    """The chain flow over HTTP, served by the simulated provider."""
+
+    def test_search_returns_matches(self, client):
+        matches = client.get("/api/market/search?q=acme").json()["matches"]
+        assert matches and matches[0]["symbol"] == "ACME"
+        assert set(matches[0]) == {"symbol", "name", "exchange", "kind"}
+
+    def test_search_for_nothing_is_an_empty_list_not_an_error(self, client):
+        response = client.get("/api/market/search?q=zzzzz")
+        assert response.status_code == 200
+        assert response.json()["matches"] == []
+
+    def test_expirations_come_back_soonest_first(self, client):
+        body = client.get("/api/market/ACME/expirations").json()
+        days = [e["days_to_expiry"] for e in body["expirations"]]
+        assert days == sorted(days)
+
+    def test_a_chain_carries_quality_and_both_volatilities(self, client):
+        expiration = client.get("/api/market/ACME/expirations").json()["expirations"][1]["date"]
+        chain = client.get(f"/api/market/ACME/chain?expiration={expiration}").json()
+        assert chain["underlying"]["price"] > 0
+        assert chain["atm_strike"] is not None
+        assert chain["rate"]["rate"] > 0
+        for contract in chain["calls"]:
+            assert set(contract["quality"]) == {"price", "implied_vol", "liquidity", "any_flag"}
+            assert contract["iv"]["source"] in ("market", "solved", "none")
+
+    def test_greeks_are_null_for_a_provider_that_supplies_none(self, client):
+        """And the capability flag says so, so the UI never has to guess."""
+        expiration = client.get("/api/market/ACME/expirations").json()["expirations"][0]["date"]
+        chain = client.get(f"/api/market/ACME/chain?expiration={expiration}").json()
+        assert client.get("/api/status").json()["market"]["supplies_greeks"] is False
+        assert all(c["greeks"] is None for c in chain["calls"])
+
+    @pytest.mark.parametrize(
+        "path,expected",
+        [
+            ("/api/market/NOPE/expirations", 404),
+            ("/api/market/ACME/chain?expiration=not-a-date", 400),
+            ("/api/market/search?q=", 422),
+        ],
+    )
+    def test_failures_carry_the_right_status(self, client, path, expected):
+        assert client.get(path).status_code == expected
+
+    def test_a_rate_limit_is_a_429_the_frontend_can_recognise(self, client, monkeypatch):
+        from market import errors as market_errors
+        from market import service
+        from market.providers.fake import FakeProvider
+
+        service.set_provider(FakeProvider(fail_with=market_errors.RateLimited()))
+        response = client.get("/api/market/ACME/expirations")
+        assert response.status_code == 429
+        assert "shortly" in response.json()["detail"]
+
+    def test_with_no_provider_the_app_says_so_and_keeps_working(self, client, monkeypatch):
+        import dataclasses
+
+        import config
+        from market import service
+
+        monkeypatch.setattr(
+            config, "settings", dataclasses.replace(config.settings, provider=config.NONE)
+        )
+        service.set_provider(None)
+        assert client.get("/api/market/ACME/expirations").status_code == 503
+        assert client.get("/api/status").json()["market"]["enabled"] is False
+        # The whole point: pricing is untouched by market data being absent.
+        assert client.post("/api/analyze", json=CONDOR).status_code == 200
+
+    def test_the_rate_endpoint_always_answers(self, client, monkeypatch):
+        from market import errors as market_errors
+        from market import rates
+
+        monkeypatch.setattr(
+            rates, "_fetch", lambda: (_ for _ in ()).throw(market_errors.ProviderUnavailable())
+        )
+        body = client.get("/api/market/rate").json()
+        assert body["is_fallback"] is True and body["rate"] > 0
+
+
+class TestMarketContextInTheRead:
+    """Market state reaches the prompt, and the cache key that guards it."""
+
+    def with_market(self, **changes):
+        leg = {
+            "option_type": "call", "strike": 100, "quantity": 1,
+            "market": {
+                "symbol": "ACME260101C00100000", "price": 5.25, "market_iv": 0.26,
+                "used_iv": 0.25, "iv_source": "market", "price_quality": "trusted",
+                "iv_quality": "trusted", "spread": 0.1, "volume": 400,
+                "open_interest": 2100,
+            },
+        }
+        leg["market"].update(changes)
+        return {**CONDOR, "legs": [leg]}
+
+    def test_a_position_built_from_contracts_gets_a_market_section(self, client):
+        body = client.post("/api/analyze", json=self.with_market()).json()
+        assert body["market"]["legs"][0]["symbol"] == "ACME260101C00100000"
+        assert body["market"]["cost"] == pytest.approx(5.25)
+        assert body["market"]["gap_pct"] is not None
+
+    def test_a_hand_entered_position_has_no_market_section(self, client):
+        assert "market" not in client.post("/api/analyze", json=CONDOR).json()
+
+    def test_a_half_real_position_has_no_market_price(self, client):
+        """Quoting a market cost for a position that is partly invented would
+        be worse than quoting none."""
+        payload = {
+            **CONDOR,
+            "legs": [
+                self.with_market()["legs"][0],
+                {"option_type": "put", "strike": 95, "quantity": -1},
+            ],
+        }
+        assert "market" not in client.post("/api/analyze", json=payload).json()
+
+    def test_the_read_key_moves_when_the_market_does(self, client):
+        """Two identical positions in different market conditions must not
+        share a cached read."""
+        first = client.post("/api/analyze", json=self.with_market()).json()["read_key"]
+        same = client.post(
+            "/api/analyze", json=self.with_market(market_iv=0.2601)
+        ).json()["read_key"]
+        different = client.post(
+            "/api/analyze", json=self.with_market(market_iv=0.40)
+        ).json()["read_key"]
+        # Rounded hard, so ordinary quote jitter still hits the cache.
+        assert first == same
+        assert first != different
+
+    def test_the_prompt_is_told_which_numbers_it_may_not_trust(self, client, monkeypatch):
+        from regime import prompts
+
+        captured = {}
+
+        def fake_generate(analysis):
+            captured["message"] = prompts.user_message(analysis)
+            yield "result", FIXTURE_READ
+
+        monkeypatch.setattr(application.regime_client, "available", lambda: True)
+        monkeypatch.setattr(application.regime_client, "generate", fake_generate)
+
+        payload = self.with_market(
+            iv_source="solved", iv_note="last traded 40 sessions ago", market_iv=3.2
+        )
+        client.post("/api/read", json=payload)
+        message = captured["message"]
+        assert "WHAT THE MARKET IS QUOTING" in message
+        assert "UNRELIABLE" in message
+        assert "last traded 40 sessions ago" in message
+
+    def test_a_trusted_quote_is_not_labelled_unreliable(self, client, monkeypatch):
+        from regime import prompts
+
+        captured = {}
+
+        def fake_generate(analysis):
+            captured["message"] = prompts.user_message(analysis)
+            yield "result", FIXTURE_READ
+
+        monkeypatch.setattr(application.regime_client, "available", lambda: True)
+        monkeypatch.setattr(application.regime_client, "generate", fake_generate)
+
+        client.post("/api/read", json=self.with_market())
+        assert "UNRELIABLE" not in captured["message"]
+        assert "passed our reliability checks" in captured["message"]

@@ -14,9 +14,10 @@ uvicorn app:app --port 8765
 ```
 
 Then open <http://127.0.0.1:8765>. Pricing, greeks and the cross-check need no
-credentials. The volatility read calls the Claude API, so it needs
-`ANTHROPIC_API_KEY` in the environment; without one the app says so once and
-everything else works normally.
+credentials, and neither does market data — Yahoo Finance needs no signup. The
+volatility read calls the Claude API, so it needs `ANTHROPIC_API_KEY` in the
+environment; without one the app says so once and everything else works
+normally. `.env.example` documents every setting.
 
 ## What it does
 
@@ -29,10 +30,14 @@ header is the result of that comparison, and it is capable of saying no.
 plain-English explanation a click away, written for someone who has not taken a
 finance class.
 
+**Loads real option chains.** Type a ticker, pick a real contract, and the
+ticket fills in — strike, spot, expiry, dividend yield, the risk-free rate and
+the market's implied volatility. Every field stays editable.
+
 **Reads the position with an LLM.** Claude is given the computed analytics —
-greeks, breakevens, the volatility shift table, the cross-check result — and
-writes up what the position is, how it is exposed to volatility, and which of
-its assumptions are fragile.
+greeks, breakevens, the volatility shift table, the cross-check result, and what
+the market is quoting — and writes up what the position is, how it is exposed to
+volatility, and which of its assumptions are fragile.
 
 ## The cross-validation
 
@@ -64,6 +69,81 @@ Tolerances were measured, not guessed, over 378 structures spanning seven
 templates, three volatility regimes, three maturities, three strikes and two
 rate levels. All 378 reach 3/3 agreement; a 1% error injected into any model is
 caught; 0.5% discretisation error is not. Both directions are in the test suite.
+
+## Market data
+
+yfinance today, [Massive](https://massive.com) (formerly Polygon.io) later.
+yfinance is an unofficial scraper of undocumented Yahoo endpoints — rate-limited
+per IP, liable to break without warning, and not licensed for commercial
+redistribution — so it is explicitly temporary. Everything provider-specific
+sits behind one interface in `market/`, and a test asserts that nothing above
+that boundary imports `yfinance` or touches a DataFrame.
+
+Adding Massive means one new adapter class and one config line. Nothing in
+`engine/`, `regime/` or `app.py` changes. Using its extra capabilities —
+provider Greeks, options history for IV rank — is additive UI work, gated on
+capability flags the provider declares as data rather than on its name.
+
+### Not trusting the data
+
+Yahoo's implied volatilities are unreliable on illiquid strikes, and feeding a
+bad one into the engine would produce a confident, wrong answer — the worst
+failure available to a product whose pitch is trustworthy numbers. So every
+contract is checked, and the thresholds were calibrated against real recorded
+chains rather than guessed. Two garbage patterns dominate, and they look nothing
+alike:
+
+- **`0.00001`.** What Yahoo emits when it cannot compute a value. Not a low
+  volatility — a null wearing a number's clothes, on contracts last traded
+  eighteen months ago.
+- **Deep-in-the-money inflation.** Observed live: 412%, 322%, 1198%, and a 294%
+  that would pass any plausible fixed ceiling. That last one is why the checks
+  include a smile test comparing each strike to its neighbours rather than to a
+  constant.
+
+Also checked: contracts with no bid, markets wider than their own mid (in both
+relative and absolute terms, so a penny spread on a five-cent option is left
+alone), dead strikes with no volume or open interest, and prices that violate
+arbitrage. That last one is tested against the **ask** rather than the mid — a
+real AAPL call quoted 13.20/15.50 against 14.70 of intrinsic has a mid below
+intrinsic and is completely normal, because the mid is a synthetic number nobody
+trades at. Only an ask below intrinsic is genuinely impossible.
+
+Quality is **per field**, not per contract. A strike whose volatility is
+nonsense may have a perfectly good two-sided quote, so its price is used and its
+volatility is not. Nothing is dropped from the chain; contracts are annotated.
+
+When a quoted volatility fails, the app solves its own from the mid price,
+prefills that, and says so — including why the market's was rejected. When there
+is nothing to solve from either, it says that too and leaves the field alone.
+There is no path where a number changes silently.
+
+### Two volatilities, and two different claims
+
+Yahoo derives its implied volatility from the *last trade*; we solve ours from
+the *mid*. So they disagree for a real, explainable reason — the last trade
+disagrees with the current quote — and both are shown.
+
+The **3/3 badge means our three models agree with each other**. It does not mean
+we agree with the market. Those are separate claims, so market agreement gets a
+separate, deliberately different-looking chip: a squared tag reading e.g.
+"Market 3.0% richer", never a pill with dots. It appears only when the
+contract's price is trustworthy, and the copy is explicit that a gap is a
+difference of opinion about volatility rather than an error in either.
+
+### Failing well
+
+yfinance fails in ways an official API does not, so each failure gets its own
+sentence: rate-limited, unknown symbol, no listed options, or unavailable. The
+cache in front of the provider is the main defence rather than an optimization,
+and on failure it serves the last known value **with its age attached** — four
+minute old prices, labelled as four minutes old, beat an error. Every path
+degrades to the manual entry the app shipped with, which still works completely;
+`CONVEXITY_MARKET_PROVIDER=none` turns market data off entirely.
+
+Freshness comes from the provider, never the UI. yfinance attaches no delay
+guarantee, so the app says "delay not documented" rather than claiming
+real-time.
 
 ## Three techniques the numerical greeks depend on
 
@@ -111,6 +191,13 @@ convexity/
 │   ├── profiles.py     the curves the chart tabs draw
 │   ├── templates.py    the seven structures the picker offers
 │   └── implied.py      implied volatility, by Brent on Black-Scholes
+├── market/           market data, behind one provider-agnostic interface
+│   ├── types.py        normalized types + the per-field quality model
+│   ├── provider.py     the Protocol, and Capabilities as data
+│   ├── quality.py      the sanity checks — shared, not per-adapter
+│   ├── cache.py        TTL + stale-while-error, the rate-limit defence
+│   ├── rates.py        the risk-free rate, its own concern
+│   └── providers/      yfinance, and a simulated one for offline work
 ├── regime/           the AI layer
 │   ├── prompts.py      a stable cached prefix, then the position's numbers
 │   ├── schema.py       the JSON contract the read must fill in
@@ -158,16 +245,26 @@ you type. It is deliberately desktop-only, 1280px and up.
 pytest
 ```
 
-312 tests, no network and no API key required — the streamed read path is
-driven from a recorded fixture. The original 46 engine tests are included
+390 tests, no network and no API key required. The streamed read runs from a
+recorded fixture, market data from a simulated provider, and the yfinance
+adapter from real recorded chains — degraded ones included, which is what the
+quality checks are tested against. The original 46 engine tests are included
 unchanged, as evidence the pricing core still does what it always did.
+
+```bash
+pytest -m network
+```
+
+Deselected by default. Hits Yahoo and checks the recorded fixtures still match
+today's responses — how an upstream change gets noticed deliberately rather than
+in production.
 
 ## Not in scope
 
-No market data feed: spot, volatility, rate and dividend are typed in, and the
-implied-volatility solver is there so a quoted price can anchor volatility in
-something observed. A real feed would need an entitled options chain, which is
-licensed, plus a dividend source and a volatility surface.
+No price history yet, so no realized volatility, no vol cone and no
+realized-versus-implied comparison. `Ticker.history()` makes all three possible
+and is the obvious next phase. No options history either, which is what gates IV
+rank and IV percentile — that one waits on the provider swap rather than on us.
 
 No accounts, no payments, no execution, no custody. The read endpoint has a
 per-hour cap because it spends real money, and that is the entire extent of the
@@ -176,4 +273,7 @@ access control.
 The volatility read is a read, not a forecast. With no price history in
 context, a claim about where volatility is heading would be invention — so the
 prompt forbids it, and the model writes about the position's own exposure,
-which the analytics fully determine.
+which the analytics fully determine. Market data widens what the read can
+honestly say without relaxing that rule: it is told which quoted figures failed
+our checks, so it cannot reason confidently from a number we already decided not
+to trust.

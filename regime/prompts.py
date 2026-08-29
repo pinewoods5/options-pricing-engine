@@ -17,6 +17,11 @@ from __future__ import annotations
 from engine import validate
 from ui import copy
 
+# Bump when the prompt changes in a way that would alter a read. It is part of
+# the cache key, so old reads written by an older prompt stop being served
+# instead of lingering indefinitely.
+PROMPT_VERSION = "2"
+
 _ROLE = """\
 You are the analyst inside Convexity, a tool that explains options positions to
 self-directed retail traders. Your reader is smart, is spending their own
@@ -54,20 +59,41 @@ price history, no earnings calendar, and no implied volatility surface.\
 _HONESTY = """\
 WHAT YOU DO NOT KNOW
 
-You are given one position's computed analytics and nothing else. There is no
-market data feed behind this product yet. That means:
+You are given one position's computed analytics, and sometimes a snapshot of
+what the market is quoting for it. Nothing else. That means:
 
-- You have no volatility history, so you cannot say whether the volatility
-  input is high or low by historical standards. Do not imply that you can.
-- You do not know what the underlying is or what it does. The ticker is a label
-  the user typed. Do not reason from a company you think it might be.
+- You have no price history and no volatility history, so you cannot say
+  whether volatility is high or low by historical standards. Do not imply that
+  you can, and do not forecast where it is going.
+- You do not know what the underlying is or what it does. Do not reason from a
+  company you think the ticker might be.
 - You do not know about upcoming events, earnings, or news.
 
 What you do have is exact: the position's greeks, how its value responds to a
 range of volatilities, its breakevens, and its worst case. Volatility exposure
-is a property of the position, and it is fully determined by what you have been
+is a property of the position and is fully determined by what you have been
 given. Write about that, confidently, and be explicit about the rest being
 outside your view when it matters to the reader's decision.\
+"""
+
+_MARKET = """\
+ABOUT THE MARKET DATA
+
+When a position was built from real listed contracts you are given what the
+market is quoting, and each figure carries a verdict on whether it can be
+trusted. Those verdicts are not decoration. Quoted volatilities from illiquid
+strikes are frequently garbage -- placeholder values, or figures implied from a
+trade that happened months ago -- and a number marked unreliable must not be
+reasoned from as though it were solid. Say it is unreliable and say why; that
+is often the most useful thing on the screen, because it tells the reader the
+contract is thinly traded.
+
+Where the market's price and our model's price differ, that is a difference of
+opinion about volatility, not an error in either. It is worth a sentence when
+the gap is material. It is a separate question from whether our three models
+agree with each other, and you should never blur the two: the models agreeing
+says our arithmetic is sound, and says nothing at all about whether the market
+shares our view.\
 """
 
 _VALIDATION = """\
@@ -115,7 +141,9 @@ ordinary market risk that any position carries.\
 
 def system_prompt() -> str:
     """The stable half. Identical for every request -- this is what gets cached."""
-    return "\n\n".join([_ROLE, _STYLE, _HONESTY, _VALIDATION, _glossary_block(), _OUTPUT])
+    return "\n\n".join(
+        [_ROLE, _STYLE, _HONESTY, _VALIDATION, _MARKET, _glossary_block(), _OUTPUT]
+    )
 
 
 def _money(value: float | None, unbounded: str = "unlimited") -> str:
@@ -161,6 +189,47 @@ def user_message(analysis: dict) -> str:
         else "none -- this position never breaks even at expiry"
     )
 
+    market = analysis.get("market")
+    market_block = ""
+    if market and market.get("legs"):
+        lines = ["", "WHAT THE MARKET IS QUOTING", ""]
+        for leg in market["legs"]:
+            lines.append(f"  {leg['symbol']}")
+            lines.append(f"    Quoted at {leg['price']:,.2f}" if leg.get("price") is not None
+                         else "    No usable quote")
+            if leg.get("market_iv") is not None:
+                lines.append(f"    Market's implied volatility: {leg['market_iv']:.1%}")
+            # The verdict travels with the number. A figure the checks rejected
+            # must not reach the model looking like one they passed.
+            if leg.get("iv_source") == "market":
+                lines.append("    That volatility passed our reliability checks.")
+            elif leg.get("iv_source") == "solved":
+                lines.append(
+                    f"    UNRELIABLE — {leg.get('iv_note') or 'rejected by our checks'} "
+                    f"We solved {leg['used_iv']:.1%} from the quote instead, and that is "
+                    f"what the analytics above use."
+                )
+            else:
+                lines.append("    No usable volatility; the value above was entered by hand.")
+            if leg.get("open_interest") is not None:
+                lines.append(
+                    f"    Open interest {leg['open_interest']:,}, "
+                    f"volume {leg.get('volume') or 0:,}"
+                )
+            if leg.get("spread") is not None:
+                lines.append(f"    Bid/ask spread {leg['spread']:,.2f}")
+        if market.get("cost") is not None and market.get("gap_pct") is not None:
+            direction = "above" if market["gap_pct"] > 0 else "below"
+            lines += [
+                "",
+                f"  The market prices this position at {market['cost']:,.2f}, which is "
+                f"{abs(market['gap_pct']):.1%} {direction} our models' "
+                f"{position['price']:,.2f}.",
+            ]
+        lines.append("")
+        lines.append(f"  Data freshness: {market.get('freshness', 'unknown')}")
+        market_block = "\n".join(lines)
+
     cross_check = [f"  {validation['headline']}."]
     if validation["disagreements"]:
         cross_check.append("  Where they part company:")
@@ -201,6 +270,7 @@ AT EXPIRY
 IF VOLATILITY MOVES (everything else held still)
 
 {shifts}
+{market_block}
 
 THE THREE-MODEL CROSS-CHECK
 

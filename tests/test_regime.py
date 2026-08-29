@@ -189,3 +189,47 @@ class TestClientConfiguration:
         assert client.available() is False
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
         assert client.available() is True
+
+
+class TestMarketAwarePrompt:
+    """The prompt's handling of market data it may or may not trust."""
+
+    def test_the_system_prompt_explains_the_quality_verdicts(self):
+        system = flat(prompts.system_prompt())
+        assert "about the market data" in system
+        assert "must not be reasoned from as though it were solid" in system
+
+    def test_it_keeps_market_disagreement_separate_from_model_agreement(self):
+        """The distinction the badge design exists to protect. If the prompt
+        blurs it, the read will blur it on the page."""
+        system = flat(prompts.system_prompt())
+        assert "difference of opinion about volatility, not an error in either" in system
+        assert "never blur the two" in system
+
+    def test_it_still_forbids_forecasting_now_that_market_data_exists(self):
+        """More data widens what is supportable; it does not relax the rule."""
+        system = flat(prompts.system_prompt())
+        assert "do not forecast where it is going" in system
+        assert "no price history and no volatility history" in system
+
+    def test_the_version_is_part_of_the_cache_key_so_edits_invalidate_reads(self):
+        assert prompts.PROMPT_VERSION
+
+    def test_a_position_with_no_market_data_gets_no_market_block(self, analysis):
+        assert "WHAT THE MARKET IS QUOTING" not in prompts.user_message(analysis)
+
+    def test_a_rejected_volatility_reaches_the_model_labelled_as_rejected(self, analysis):
+        analysis["market"] = {
+            "legs": [{
+                "symbol": "ACME260101C00100000", "price": 5.25, "market_iv": 3.2,
+                "used_iv": 0.27, "iv_source": "solved",
+                "iv_note": "last traded 40 sessions ago", "open_interest": 12,
+                "volume": 0, "spread": 1.4,
+            }],
+            "cost": 5.25, "gap_pct": 0.031, "freshness": "Yahoo Finance",
+        }
+        message = prompts.user_message(analysis)
+        assert "UNRELIABLE" in message
+        assert "last traded 40 sessions ago" in message
+        assert "27.0%" in message  # what the analytics actually used
+        assert "3.1% above our models" in message
