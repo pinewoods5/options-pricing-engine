@@ -87,6 +87,18 @@ class Quote:
     values: dict[str, float]
     errors: dict[str, float] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        """Coerce numpy scalars to plain floats.
+
+        Most of these numbers arrive from numpy expressions, so they are
+        np.float64 rather than float. That is invisible right up until the API
+        layer tries to serialize one and fails, so it is fixed once here at the
+        boundary rather than at each of the places that would otherwise have to
+        remember.
+        """
+        object.__setattr__(self, "values", {k: float(v) for k, v in self.values.items()})
+        object.__setattr__(self, "errors", {k: float(v) for k, v in self.errors.items()})
+
     def scaled(self, quantity: float) -> "Quote":
         """This quote for `quantity` contracts (negative for a short leg).
 

@@ -131,12 +131,12 @@ def _tolerance(metric: str, reference: float) -> float:
 def _deterministic_cell(model: str, metric: str, value: float, reference: float) -> Cell:
     tolerance = _tolerance(metric, reference)
     difference = value - reference
-    agrees = abs(difference) <= tolerance
+    agrees = bool(abs(difference) <= tolerance)
     return Cell(
         model=model,
-        value=value,
+        value=float(value),
         error=None,
-        difference=difference,
+        difference=float(difference),
         agrees=agrees,
         basis=(
             f"within {tolerance:.4g} of the reference"
@@ -157,8 +157,8 @@ def _sampled_cell(model: str, metric: str, value: float, error: float, reference
     tolerance = _tolerance(metric, reference)
     difference = value - reference
     interval = CONFIDENCE_SIGMAS * error
-    within_interval = abs(difference) <= interval
-    agrees = within_interval or abs(difference) <= tolerance
+    within_interval = bool(abs(difference) <= interval)
+    agrees = bool(within_interval or abs(difference) <= tolerance)
     basis = (
         f"reference is inside its own error bar (+/-{interval:.4g})"
         if within_interval
@@ -167,8 +167,8 @@ def _sampled_cell(model: str, metric: str, value: float, error: float, reference
         else f"off by {abs(difference):.4g}, outside both its error bar "
         f"(+/-{interval:.4g}) and the {tolerance:.4g} tolerance"
     )
-    return Cell(model=model, value=value, error=error, difference=difference,
-                agrees=agrees, basis=basis)
+    return Cell(model=model, value=float(value), error=float(error),
+                difference=float(difference), agrees=agrees, basis=basis)
 
 
 def _headline(agreeing: int, total: int, status: str) -> str:
@@ -198,7 +198,7 @@ def cross_validate(
 
     rows = []
     for metric in G.METRICS:
-        ref = reference.values[metric]
+        ref = float(reference.values[metric])
         rows.append(
             Row(
                 metric=metric,

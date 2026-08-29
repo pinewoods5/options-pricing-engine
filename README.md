@@ -1,129 +1,179 @@
-# Options Pricing Engine
+# Convexity
 
-A small engine that prices vanilla European (and American, via the binomial
-tree) options three independent ways and cross-validates them against each
-other:
+An options analytics tool for self-directed retail traders. It prices a
+position three independent ways, checks the three against each other, and
+explains the result in plain English.
 
-1. **Black-Scholes** — closed-form price and the 5 standard greeks.
-2. **Binomial tree (CRR)** — European first, extended to American with an
-   early-exercise check at every node.
-3. **Monte Carlo** — antithetic-variate simulation of the terminal stock
-   price, with a reported standard error and confidence interval.
-
-All three pricers take the same input, `OptionParams` (spot, strike, rate,
-vol, time to expiry, option type), so they're directly comparable.
-
-## The math, briefly
-
-**Black-Scholes.** For a non-dividend-paying underlying under geometric
-Brownian motion, the risk-neutral price of a European call/put has a closed
-form in terms of `d1`, `d2`:
-
-```
-d1 = (ln(S/K) + (r + sigma^2/2) T) / (sigma * sqrt(T))
-d2 = d1 - sigma * sqrt(T)
-
-call = S * N(d1) - K * exp(-rT) * N(d2)
-put  = K * exp(-rT) * N(-d2) - S * N(-d1)
-```
-
-The greeks (delta, gamma, vega, theta, rho) are the analytic partial
-derivatives of this formula with respect to spot, vol, time, and rate.
-
-**Binomial tree (CRR).** Discretizes time into `N` steps of length
-`dt = T/N`. At each step the stock moves up by `u = exp(sigma*sqrt(dt))` or
-down by `d = 1/u`, with risk-neutral probability
-`p = (exp(r*dt) - d) / (u - d)`. Terminal payoffs are computed at the leaves
-and discounted backward one step at a time. As `N -> infinity`, the CRR tree
-provably converges to the Black-Scholes price for European options — this is
-exactly the discrete-time limit of the same risk-neutral pricing argument.
-For American options, at each backward step the model additionally checks
-whether immediate exercise (intrinsic value) beats holding the option
-(discounted continuation value), which is what lets it price early-exercise
-premium that Black-Scholes cannot capture.
-
-**Monte Carlo.** Simulates the terminal stock price directly (no need for
-the full path, since payoff only depends on `S_T` for vanilla options):
-
-```
-S_T = S0 * exp((r - sigma^2/2) T + sigma * sqrt(T) * Z),   Z ~ N(0, 1)
-```
-
-then averages the discounted payoff over many draws. **Antithetic
-variates**: for every draw `Z` we also use `-Z`. Because payoffs from a `Z`
-and `-Z` pair are negatively correlated, averaging each pair before taking
-the overall mean reduces the variance of the price estimate compared to the
-same number of independent draws — you get a tighter confidence interval
-for the same simulation budget.
-
-## Project layout
-
-```
-options-pricing-engine/
-├── pricers/
-│   ├── common.py        # OptionParams (shared inputs), OptionType, validation
-│   ├── black_scholes.py # price() + greeks()
-│   ├── binomial.py      # price_european(), price_american()
-│   └── monte_carlo.py   # price() -> price, std_error, confidence interval
-├── compare.py            # prints a 3-way comparison table + convergence plots
-└── tests/                 # pytest suite: convergence & consistency checks
-```
-
-## Setup
+It is analytics and education, not a broker: there is no execution, no custody,
+and nothing here places an order.
 
 ```bash
-cd options-pricing-engine
-python3 -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+uvicorn app:app --port 8765
 ```
 
-## Running the comparison
+Then open <http://127.0.0.1:8765>. Pricing, greeks and the cross-check need no
+credentials. The volatility read calls the Claude API, so it needs
+`ANTHROPIC_API_KEY` in the environment; without one the app says so once and
+everything else works normally.
 
-```bash
-python compare.py
+## What it does
+
+**Cross-validates three pricing models.** Black-Scholes closed form, a
+Cox-Ross-Rubinstein binomial tree, and antithetic Monte Carlo, compared on six
+numbers each — price and all five greeks — not just on price. The badge in the
+header is the result of that comparison, and it is capable of saying no.
+
+**Explains everything.** Every greek, every model and every figure has a
+plain-English explanation a click away, written for someone who has not taken a
+finance class.
+
+**Reads the position with an LLM.** Claude is given the computed analytics —
+greeks, breakevens, the volatility shift table, the cross-check result — and
+writes up what the position is, how it is exposed to volatility, and which of
+its assumptions are fragile.
+
+## The cross-validation
+
+This is the part worth explaining, because a trust indicator that cannot fail
+is decoration.
+
+Black-Scholes is the reference: it is exact for this contract class, so a
+difference is evidence about the other two. Each of them is checked on all six
+metrics, with a per-metric tolerance — one threshold across numbers that range
+from a gamma of 0.019 to a vega of 37 would be meaningless — and an absolute
+floor for the case where a spread's metric legitimately nets out near zero.
+
+Monte Carlo is judged against **its own error bar** rather than an invented
+tolerance. Because its greeks are computed from per-path differences, every
+metric carries a real standard error, and the question asked is whether the
+reference falls inside the interval it claims for itself. Four standard
+deviations, not two: six metrics are tested at once, so a per-metric 95% band
+would flag about a quarter of perfectly correct positions on multiplicity
+alone.
+
+Early exercise is reported *beside* the check rather than inside it. Only the
+lattice can price it, so the three-way comparison always runs on the European
+lattice — an ability gap between models is not a disagreement between them. The
+sign is explained rather than assumed: on a net short position, early exercise
+belongs to the other side, and the interface calls that assignment risk instead
+of a premium.
+
+Tolerances were measured, not guessed, over 378 structures spanning seven
+templates, three volatility regimes, three maturities, three strikes and two
+rate levels. All 378 reach 3/3 agreement; a 1% error injected into any model is
+caught; 0.5% discretisation error is not. Both directions are in the test suite.
+
+## Three techniques the numerical greeks depend on
+
+Each has a test that fails if the technique is removed.
+
+**Common random numbers.** Two independent Monte Carlo runs differ by more
+sampling noise than a 1% spot bump creates, so a naive finite difference
+returns noise rather than a derivative. Drawing both sides of every bump from
+one seed makes the runs share every draw. It cuts the delta error by more than
+twentyfold, and differencing the raw per-path vectors is also what yields each
+greek's standard error.
+
+**Lattice extraction for delta and gamma.** A second difference on a CRR tree
+divides the lattice's own wobble by `h²`, which amplifies it into the answer —
+at 801 steps a 0.5% bump returns a gamma of exactly zero against a true 0.0188,
+and no combination of step count and bump size in between is dependable.
+Growing the tree by two steps and rolling back to step 2 gives three nodes at
+spots `S·d²`, `S` and `S·u²`, all valued at time 0, so both derivatives come
+off the lattice with no bump at all.
+
+**Fixed-`dt` theta.** Bumping time while holding the step count fixed also
+changes `dt`, and with it `u`, `d` and `p` — so the difference measures a change
+of lattice as much as a change of time. Moving by whole tree steps keeps the
+geometry identical on both sides. On a bull call spread this took theta from
+40% wrong to 0.7%.
+
+Vega needed neither trick, only a bump proportional to volatility rather than a
+fixed number of points: five points is reasonable at 25% vol and badly wrong at
+15%, where it means bumping from 10% to 20%.
+
+## Layout
+
+```
+convexity/
+├── pricers/          the three models — the original engine, unchanged in kind
+│   ├── common.py       OptionParams (spot, strike, rate, vol, time, type, dividend)
+│   ├── black_scholes.py  closed-form price and the five analytic greeks
+│   ├── binomial.py       European, American, and lattice-extracted delta/gamma
+│   └── monte_carlo.py    antithetic simulation; exposes its per-path payoffs
+├── engine/           the product's calculation layer, wrapping the pricers
+│   ├── structure.py    multi-leg positions, portfolio aggregation, fingerprints
+│   ├── greeks.py       one comparable quote from each of the three models
+│   ├── validate.py     the agreement matrix and the tolerances behind the badge
+│   ├── payoff.py       breakevens and extremes, solved rather than sampled
+│   ├── profiles.py     the curves the chart tabs draw
+│   ├── templates.py    the seven structures the picker offers
+│   └── implied.py      implied volatility, by Brent on Black-Scholes
+├── regime/           the AI layer
+│   ├── prompts.py      a stable cached prefix, then the position's numbers
+│   ├── schema.py       the JSON contract the read must fill in
+│   └── client.py       one streamed request to claude-opus-5
+├── app.py            FastAPI: synchronous pricing, streamed read
+├── serialize.py      one JSON view, shared by the page and the prompt
+├── store.py          SQLite cache of reads, keyed by position fingerprint
+├── static/           the frontend — no framework, no build step
+├── compare.py        the original CLI, still works
+└── tests/            312 tests
 ```
 
-This prices a default ATM call (S=100, K=100, r=5%, vol=20%, T=1y), prints a
-table with the Black-Scholes price/greeks, the binomial (European and
-American) price, and the Monte Carlo price with its 95% confidence interval.
-It also writes two convergence charts to `output/`:
+## How it stays fast
 
-- `binomial_convergence.png` — binomial price vs. number of tree steps,
-  converging to the Black-Scholes reference line.
-- `monte_carlo_convergence.png` — Monte Carlo price and its shrinking
-  confidence band vs. number of simulated paths, converging to the same
-  reference line.
+Pricing is synchronous because it is quick: about 35ms for a single leg and
+140ms for a four-leg condor, covering three models, six metrics each, the
+payoff geometry and both chart profiles. Nothing in that path waits on a
+network, so the page is fully populated and interactive almost immediately.
 
-Any option can be priced via flags, e.g. an ITM put:
+The read is the only slow part, so it is the only streamed part. It fires on a
+long debounce — once the position has actually stopped moving — and arrives in
+a card below numbers that are already on screen. Reads are cached in SQLite
+against a deliberately coarse fingerprint of the position: a tenth of a cent of
+spot is not a different position and must not cost another call, while a dollar
+is. The system prompt is byte-identical on every request and carries a cache
+breakpoint, so its tokens are served from cache after the first call.
 
-```bash
-python compare.py --spot 100 --strike 120 --type put
-```
+## Frontend
 
-Run `python compare.py --help` for the full list of flags (spot, strike,
-rate, vol, time, type, binomial steps, MC paths, seed).
+Hand-written HTML, CSS and ES, with charts drawn as inline SVG. No framework
+and no build step — this machine has no Node, the shapes are polylines, and the
+numeric styling has to match the tables beside it exactly.
 
-## Running the tests
+The shell takes its interaction patterns from X: an icon rail, one content
+column at a readable width, a context panel on the right, hairline rules rather
+than shadows, a tab bar with an indicator that slides, and a modal for creating
+something new. The contents take their discipline from Nordnet: dense tabular
+figures, right-aligned with tabular numerals so decimals line up down a column,
+sober green and red, and an order-ticket-shaped input panel that re-prices as
+you type. It is deliberately desktop-only, 1280px and up.
+
+## Tests
 
 ```bash
 pytest
 ```
 
-The suite checks, for ATM/ITM/OTM cases:
-- Black-Scholes matches known reference values and satisfies put-call
-  parity.
-- The binomial European price converges to Black-Scholes as steps increase,
-  and American prices are consistent (>= European, >= intrinsic value, and
-  equal to the European call when there's no dividend to make early
-  exercise optimal).
-- The Monte Carlo price converges to Black-Scholes within its own reported
-  standard error, its confidence interval has correct coverage across
-  repeated seeds, and antithetic variates measurably reduce variance versus
-  a naive estimator using the same number of random draws.
+312 tests, no network and no API key required — the streamed read path is
+driven from a recorded fixture. The original 46 engine tests are included
+unchanged, as evidence the pricing core still does what it always did.
 
-## Not in scope (yet)
+## Not in scope
 
-Exotic/path-dependent options, implied volatility surfaces, live market
-data, and a CLI/Streamlit front-end are intentionally left out of this core
-engine and may be layered on top later.
+No market data feed: spot, volatility, rate and dividend are typed in, and the
+implied-volatility solver is there so a quoted price can anchor volatility in
+something observed. A real feed would need an entitled options chain, which is
+licensed, plus a dividend source and a volatility surface.
+
+No accounts, no payments, no execution, no custody. The read endpoint has a
+per-hour cap because it spends real money, and that is the entire extent of the
+access control.
+
+The volatility read is a read, not a forecast. With no price history in
+context, a claim about where volatility is heading would be invention — so the
+prompt forbids it, and the model writes about the position's own exposure,
+which the analytics fully determine.

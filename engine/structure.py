@@ -163,3 +163,38 @@ def american_premium(structure: Structure, steps: int = G.DEFAULT_BINOMIAL_STEPS
     american = binomial_quote(structure, steps, american=True)
     european = binomial_quote(structure, steps, american=False)
     return american.values["price"] - european.values["price"]
+
+
+def fingerprint(structure: Structure) -> str:
+    """A stable id for "the same position, near enough".
+
+    The AI read is the one expensive part of an analysis, so it is cached
+    against this rather than regenerated whenever a slider twitches. Inputs are
+    rounded before hashing, at the resolution where the read would actually
+    change its mind: a cent of spot, half a volatility point, five basis
+    points, a day of expiry. Nudging spot by a tenth of a cent produces the
+    same fingerprint and reuses the cached read; moving it by a dollar does
+    not.
+
+    Legs are sorted so that the same position entered in a different order is
+    recognised as the same position.
+    """
+    import hashlib
+
+    legs = sorted(
+        (leg.option_type.value, round(leg.strike, 4), leg.quantity)
+        for leg in structure.legs
+    )
+    payload = "|".join(
+        [
+            structure.underlying.strip().upper(),
+            structure.style,
+            f"{round(structure.spot, 2):.2f}",
+            f"{round(structure.vol / 0.005) * 0.005:.4f}",
+            f"{round(structure.rate / 0.0005) * 0.0005:.4f}",
+            f"{round(structure.dividend / 0.0005) * 0.0005:.4f}",
+            f"{round(structure.time * 365):d}",
+            *(f"{t}:{k}:{q}" for t, k, q in legs),
+        ]
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()[:32]
