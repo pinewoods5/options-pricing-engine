@@ -99,8 +99,16 @@ class TestReferenceEndpoints:
 
     def test_status_reports_what_is_available(self, client):
         body = client.get("/api/status").json()
-        assert set(body) == {"read_available", "models"}
+        assert set(body) == {"read_available", "models", "market"}
         assert len(body["models"]) == 3
+
+    def test_status_describes_the_market_provider_but_never_its_key(self, client):
+        market = client.get("/api/status").json()["market"]
+        assert market["enabled"] is True
+        assert market["label"]
+        assert "supplies_greeks" in market
+        # Nothing secret may appear here, however the provider is configured.
+        assert not any("key" in k.lower() for k in market)
 
     def test_glossary_carries_every_greek_the_tables_show(self, client):
         body = client.get("/api/glossary").json()

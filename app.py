@@ -14,17 +14,23 @@ import json
 import time
 from collections import deque
 from contextlib import asynccontextmanager
+from datetime import date
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import config
 import serialize
 import store
 from engine import templates, validate
+from market import cache as market_cache
+from market import errors as market_errors
+from market import rates as market_rates
+from market import service as market
 from engine.implied import NoImpliedVol, implied_vol
 from engine.structure import Leg, Structure, fingerprint
 from pricers.common import OptionParams
@@ -48,9 +54,27 @@ READ_LIMIT_PER_HOUR = 60
 _read_times: deque[float] = deque()
 
 
+# Provider failures map onto the status code that best describes them, so the
+# frontend can tell "try again shortly" apart from "that symbol doesn't exist"
+# without parsing prose.
+MARKET_STATUS = {
+    market_errors.SymbolNotFound: 404,
+    market_errors.NoOptionsListed: 404,
+    market_errors.ExpirationNotFound: 404,
+    market_errors.RateLimited: 429,
+    market_errors.ProviderNotConfigured: 503,
+    market_errors.ProviderUnavailable: 502,
+}
+
+
+def _market_error(exc: market_errors.MarketDataError) -> HTTPException:
+    return HTTPException(status_code=MARKET_STATUS.get(type(exc), 502), detail=exc.message)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     store.init()
+    market_cache.init()
     if regime_client is None or not regime_client.available():
         print(
             "\n  Convexity: no ANTHROPIC_API_KEY set.\n"
@@ -122,11 +146,54 @@ def index() -> FileResponse:
 
 @app.get("/api/status")
 def status() -> dict:
-    """What the interface can offer right now."""
+    """What the interface can offer right now.
+
+    Reports whether a market provider is configured and what it can do, never
+    what it is configured *with* -- no key, or part of one, appears here.
+    """
     return {
         "read_available": regime_client is not None and regime_client.available(),
         "models": ["Black-Scholes", "Binomial tree", "Monte Carlo"],
+        "market": {
+            "enabled": config.settings.market_enabled,
+            **market.capabilities().as_dict(),
+        },
     }
+
+
+@app.get("/api/market/search")
+def market_search(q: str = Query(min_length=1, max_length=40), limit: int = 8) -> dict:
+    """Symbols matching a query. Never an error for "no matches"."""
+    try:
+        return {"matches": market.search(q, min(limit, 20))}
+    except market_errors.MarketDataError as exc:
+        raise _market_error(exc) from exc
+
+
+@app.get("/api/market/{symbol}/expirations")
+def market_expirations(symbol: str) -> dict:
+    try:
+        return {"symbol": symbol.upper(), "expirations": market.expirations(symbol)}
+    except market_errors.MarketDataError as exc:
+        raise _market_error(exc) from exc
+
+
+@app.get("/api/market/{symbol}/chain")
+def market_chain(symbol: str, expiration: str) -> dict:
+    try:
+        wanted = date.fromisoformat(expiration)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="expiration must be YYYY-MM-DD") from exc
+    try:
+        return market.chain(symbol, wanted)
+    except market_errors.MarketDataError as exc:
+        raise _market_error(exc) from exc
+
+
+@app.get("/api/market/rate")
+def market_rate() -> dict:
+    """The risk-free rate. Always answers -- it falls back rather than failing."""
+    return market_rates.current().as_dict()
 
 
 @app.get("/api/glossary")
